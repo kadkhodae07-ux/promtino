@@ -1,0 +1,442 @@
+name: Build Promptino 2.6.6+60 Bazaar and Myket APKs
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+env:
+  EXPECTED_FLUTTER_ZIP: promptino_flutter_v2_6_6_60_backend_connection_repair.zip
+  EXPECTED_APP_VERSION: 2.6.6+60
+  EXPECTED_PACKAGE_NAME: mk.kadkhodai.promt
+  PROMPTINO_API_BASE_URL: https://www.podtman.anony.ir/promt/api
+  PROMPTINO_API_FALLBACK_BASE_URL: https://podtman.anony.ir/promt/api
+  ANDROID_COMPILE_SDK: "36"
+  ANDROID_BUILD_TOOLS: "36.0.0"
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select exact Flutter source ZIP
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf extracted_flutter app dist ci-logs
+          mkdir -p extracted_flutter dist ci-logs
+
+          if [[ ! -f "$EXPECTED_FLUTTER_ZIP" ]]; then
+            echo "Required Flutter ZIP was not found: $EXPECTED_FLUTTER_ZIP" >&2
+            echo "Available ZIP files:" >&2
+            find . -maxdepth 2 -type f -name '*.zip' -print >&2 || true
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib
+          import shutil
+          import sys
+          import zipfile
+
+          expected = Path("promptino_flutter_v2_6_6_60_backend_connection_repair.zip")
+          if not expected.is_file():
+              raise SystemExit(f"Expected ZIP not found: {expected}")
+
+          digest = hashlib.sha256(expected.read_bytes()).hexdigest()
+          print(f"Selected Flutter ZIP: {expected}")
+          print(f"Source ZIP SHA256: {digest}")
+
+          try:
+              with zipfile.ZipFile(expected, "r") as archive:
+                  bad_member = archive.testzip()
+                  if bad_member is not None:
+                      raise SystemExit(f"Corrupted ZIP member: {bad_member}")
+                  archive.extractall("extracted_flutter")
+          except zipfile.BadZipFile as exc:
+              raise SystemExit(f"Invalid Flutter ZIP: {exc}")
+
+          projects = []
+          for pubspec in Path("extracted_flutter").rglob("pubspec.yaml"):
+              root = pubspec.parent
+              if (root / "lib" / "main.dart").is_file() and (root / "tools" / "prepare_android.sh").is_file():
+                  projects.append(root)
+
+          if len(projects) != 1:
+              print("Exactly one Flutter project must exist in the expected ZIP.")
+              for project in projects:
+                  print(project)
+              sys.exit(1)
+
+          shutil.copytree(projects[0], "app")
+          Path("dist/source-fingerprint.txt").write_text(
+              f"ZIP: {expected.name}\nSHA256: {digest}\nProject root: {projects[0]}\n",
+              encoding="utf-8",
+          )
+          print(f"Flutter project extracted from: {projects[0]}")
+          PY
+
+          test -f app/pubspec.yaml
+          test -f app/lib/main.dart
+          test -f app/tools/prepare_android.sh
+
+          source_sha="$(sha256sum "$EXPECTED_FLUTTER_ZIP" | awk '{print $1}')"
+          echo "source_sha=$source_sha" >> "$GITHUB_OUTPUT"
+          echo "### Promptino source" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ZIP: \`$EXPECTED_FLUTTER_ZIP\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- SHA-256: \`$source_sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify source version and required fixes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version_line="$(grep -E '^version:' app/pubspec.yaml | head -n 1 | sed -E 's/^version:[[:space:]]*//')"
+          if [[ "$version_line" != "$EXPECTED_APP_VERSION" ]]; then
+            echo "Wrong Flutter ZIP version. Expected $EXPECTED_APP_VERSION but found $version_line." >&2
+            exit 1
+          fi
+
+          grep -Eq '^  adivery:[[:space:]]*\^4\.9\.0$' app/pubspec.yaml
+          grep -q "reward_prepare.php" app/lib/main.dart
+          grep -q "reward_claim.php" app/lib/main.dart
+          grep -q "prompt_engagement.php" app/lib/main.dart
+          grep -q "enum RewardUiState" app/lib/main.dart
+          grep -q "serverPromptId" app/lib/main.dart
+          grep -q "requestId:" app/lib/main.dart
+          grep -q "technicalMessage" app/lib/main.dart
+          grep -q "healthCheck(force: true)" app/lib/main.dart
+          grep -q "class PromptinoApiException" app/lib/main.dart
+          grep -q "html_response" app/lib/main.dart
+          grep -q "dns_or_network_error" app/lib/main.dart
+          grep -q "searchServerError" app/lib/main.dart
+          grep -q "accountServerSynced" app/lib/main.dart
+          grep -q "PROMPTINO_API_BASE_URL" app/lib/main.dart
+
+          if grep -Eq "78\.3K|12\.4K|const Text\('4\.8'" app/lib/main.dart; then
+            echo "Fixed/demo engagement statistics were detected in release source." >&2
+            exit 1
+          fi
+
+          if grep -Eq "JSON معتبر نبود|نسخه جدید بک.?اند|Backend را" app/lib/main.dart; then
+            echo "Technical backend/debug text was detected in user-facing source." >&2
+            exit 1
+          fi
+
+          main_lines="$(wc -l < app/lib/main.dart | tr -d ' ')"
+          main_sha="$(sha256sum app/lib/main.dart | awk '{print $1}')"
+          {
+            echo "App version: $version_line"
+            echo "main.dart lines: $main_lines"
+            echo "main.dart SHA256: $main_sha"
+          } | tee -a dist/source-fingerprint.txt
+
+          echo "- App version: \`$version_line\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- main.dart lines: \`$main_lines\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- main.dart SHA-256: \`$main_sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Read shared Bazaar and Myket version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version_line="$(grep -E '^version:' app/pubspec.yaml | head -n 1 | sed -E 's/^version:[[:space:]]*//')"
+          test -n "$version_line"
+
+          if [[ "$version_line" != *"+"* ]]; then
+            echo "Version must include a numeric build code." >&2
+            exit 1
+          fi
+
+          build_name="${version_line%%+*}"
+          build_number="${version_line##*+}"
+
+          if ! [[ "$build_number" =~ ^[1-9][0-9]*$ ]]; then
+            echo "Invalid Android versionCode: $build_number" >&2
+            exit 1
+          fi
+
+          echo "build_name=$build_name" >> "$GITHUB_OUTPUT"
+          echo "build_number=$build_number" >> "$GITHUB_OUTPUT"
+          echo "app_version=$version_line" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 36
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-${ANDROID_COMPILE_SDK}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}"
+
+      - name: Set up pinned Flutter 3.44.8
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.44.8'
+          channel: stable
+          cache: true
+
+      - name: Record toolchain versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter --version | tee ci-logs/flutter-version.txt
+          java -version 2>&1 | tee ci-logs/java-version.txt
+          sdkmanager --version | tee ci-logs/sdkmanager-version.txt
+
+      - name: Restore Android signing files
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_PROPERTIES_BASE64: ${{ secrets.ANDROID_KEY_PROPERTIES_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p app/android
+
+          if [[ -n "${ANDROID_KEYSTORE_BASE64:-}" ]]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > app/android/bazikhone_release_key.jks
+          fi
+
+          if [[ -n "${ANDROID_KEY_PROPERTIES_BASE64:-}" ]]; then
+            printf '%s' "$ANDROID_KEY_PROPERTIES_BASE64" | base64 --decode > app/android/key.properties
+          fi
+
+          test -s app/android/bazikhone_release_key.jks || {
+            echo "Android keystore is missing." >&2
+            exit 1
+          }
+
+          test -s app/android/key.properties || {
+            echo "android/key.properties is missing." >&2
+            exit 1
+          }
+
+      - name: Generate and patch Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x app/tools/prepare_android.sh
+          (
+            cd app
+            bash tools/prepare_android.sh
+          ) 2>&1 | tee ci-logs/prepare-android.log
+
+      - name: Get Flutter dependencies
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          flutter pub get 2>&1 | tee ../ci-logs/flutter-pub-get.log
+
+      - name: Analyze Flutter source
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          flutter analyze 2>&1 | tee ../ci-logs/flutter-analyze.log
+
+      - name: Run Flutter tests
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          flutter test 2>&1 | tee ../ci-logs/flutter-test.log
+
+      - name: Verify generated release project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -f app/lib/main.dart
+          test -f app/test/model_smoke_test.dart
+          test ! -f app/test/widget_test.dart
+          test -f app/android/app/build.gradle
+          test -f app/android/app/src/main/res/drawable-nodpi/splash_screen.png
+          test ! -f app/android/app/build.gradle.kts
+
+          if grep -q "Flutter Demo Home Page" app/lib/main.dart; then
+            echo "Default Flutter demo source was detected." >&2
+            exit 1
+          fi
+
+          grep -q "$EXPECTED_PACKAGE_NAME" app/android/app/build.gradle
+          grep -q "jvmTarget = '17'" app/android/app/build.gradle
+
+      - name: Build signed shared APK
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          flutter build apk --release --no-shrink \
+            --build-name=${{ steps.version.outputs.build_name }} \
+            --build-number=${{ steps.version.outputs.build_number }} \
+            --dart-define=PROMPTINO_API_BASE_URL="${PROMPTINO_API_BASE_URL}" \
+            --dart-define=PROMPTINO_API_FALLBACK_BASE_URL="${PROMPTINO_API_FALLBACK_BASE_URL}" \
+            2>&1 | tee ../ci-logs/flutter-build-apk.log
+
+      - name: Create Bazaar and Myket deliverables
+        shell: bash
+        env:
+          BUILD_NAME: ${{ steps.version.outputs.build_name }}
+          BUILD_NUMBER: ${{ steps.version.outputs.build_number }}
+          APP_VERSION: ${{ steps.version.outputs.app_version }}
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          apk="app/build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$apk" || { echo "Release APK was not created." >&2; exit 1; }
+
+          aapt_bin="${ANDROID_HOME}/build-tools/${ANDROID_BUILD_TOOLS}/aapt"
+          test -x "$aapt_bin" || { echo "Android aapt was not found." >&2; exit 1; }
+
+          badging="$($aapt_bin dump badging "$apk")"
+          echo "$badging" | tee ci-logs/apk-badging.txt
+
+          grep -q "package: name='${EXPECTED_PACKAGE_NAME}'" <<< "$badging"
+          grep -q "versionCode='${BUILD_NUMBER}'" <<< "$badging"
+          grep -q "versionName='${BUILD_NAME}'" <<< "$badging"
+
+          mkdir -p dist/bazaar dist/myket
+
+          bazaar_apk="dist/bazaar/promptino-bazaar-v${APP_VERSION}.apk"
+          myket_apk="dist/myket/promptino-myket-v${APP_VERSION}.apk"
+
+          cp "$apk" "$bazaar_apk"
+          cp "$apk" "$myket_apk"
+
+          bazaar_sha="$(sha256sum "$bazaar_apk" | awk '{print $1}')"
+          myket_sha="$(sha256sum "$myket_apk" | awk '{print $1}')"
+
+          if [[ "$bazaar_sha" != "$myket_sha" ]]; then
+            echo "Bazaar and Myket APK hashes are unexpectedly different." >&2
+            exit 1
+          fi
+
+          cat > dist/bazaar/MARKET_VERSION.txt <<EOF
+          Store: Cafe Bazaar
+          Package: ${EXPECTED_PACKAGE_NAME}
+          versionName: ${BUILD_NAME}
+          versionCode: ${BUILD_NUMBER}
+          APK SHA256: ${bazaar_sha}
+          Source ZIP SHA256: ${SOURCE_SHA}
+          EOF
+
+          cat > dist/myket/MARKET_VERSION.txt <<EOF
+          Store: Myket
+          Package: ${EXPECTED_PACKAGE_NAME}
+          versionName: ${BUILD_NAME}
+          versionCode: ${BUILD_NUMBER}
+          APK SHA256: ${myket_sha}
+          Source ZIP SHA256: ${SOURCE_SHA}
+          EOF
+
+          cp dist/source-fingerprint.txt dist/bazaar/SOURCE_FINGERPRINT.txt
+          cp dist/source-fingerprint.txt dist/myket/SOURCE_FINGERPRINT.txt
+
+          echo "### APK output" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Package: \`${EXPECTED_PACKAGE_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- versionName: \`${BUILD_NAME}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- versionCode: \`${BUILD_NUMBER}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- APK SHA-256: \`${bazaar_sha}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Bazaar APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: promptino-bazaar-v${{ steps.version.outputs.app_version }}
+          path: dist/bazaar/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Myket APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: promptino-myket-v${{ steps.version.outputs.app_version }}
+          path: dist/myket/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Collect failure diagnostics
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          set +e
+          mkdir -p ci-logs
+          cp app/pubspec.yaml ci-logs/pubspec.yaml 2>/dev/null || true
+          cp app/lib/main.dart ci-logs/main.dart 2>/dev/null || true
+          find app -maxdepth 4 -type f | sort > ci-logs/source-file-list.txt 2>/dev/null || true
+          flutter doctor -v > ci-logs/flutter-doctor.txt 2>&1 || true
+          df -h > ci-logs/disk-usage.txt 2>&1 || true
+          free -h > ci-logs/memory.txt 2>&1 || true
+
+      - name: Upload failure diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: promptino-failure-diagnostics-${{ github.run_number }}
+          path: ci-logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Delete older Promptino build artifacts
+        if: ${{ success() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const currentRunId = Number(context.runId);
+            const artifacts = await github.paginate(
+              github.rest.actions.listArtifactsForRepo,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+              },
+            );
+
+            const oldPromptinoArtifacts = artifacts.filter((artifact) => {
+              const isRelease = artifact.name.startsWith('promptino-bazaar-v') ||
+                artifact.name.startsWith('promptino-myket-v');
+              const isDiagnostic = artifact.name.startsWith('promptino-failure-diagnostics-');
+              const artifactRunId = Number(artifact.workflow_run?.id ?? 0);
+              return (isRelease || isDiagnostic) && artifactRunId > 0 && artifactRunId !== currentRunId;
+            });
+
+            for (const artifact of oldPromptinoArtifacts) {
+              core.info(`Deleting old artifact: ${artifact.name} (${artifact.id})`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+              });
+            }
+
+            core.info(`Deleted ${oldPromptinoArtifacts.length} old Promptino artifact(s).`);
